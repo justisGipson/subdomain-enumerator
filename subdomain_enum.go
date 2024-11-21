@@ -22,6 +22,15 @@ const (
 	resolverCount  = 10
 	batchSize      = 100
 	ctQueryTimeout = 10 * time.Second
+	maxRetries     = 3
+	retryDelay     = 2 * time.Second
+	ctRateLimit    = 500 * time.Millisecond // Time between crt.sh requests
+)
+
+var (
+	ctRateLimiter = time.NewTicker(ctRateLimit)
+	lastCTQuery   = time.Now()
+	ctMutex       sync.Mutex
 )
 
 var resolvers = []string{
@@ -242,55 +251,97 @@ func processDomain(domain string, wordlist []string, stats *ScanStats) *DomainRe
 }
 
 func queryCTSource(domain string, source CTSource) []Result {
-	ctx, cancel := context.WithTimeout(context.Background(), ctQueryTimeout)
-	defer cancel()
+	// Rate limiting
+	ctMutex.Lock()
+	timeSinceLastQuery := time.Since(lastCTQuery)
+	if timeSinceLastQuery < ctRateLimit {
+		time.Sleep(ctRateLimit - timeSinceLastQuery)
+	}
+	lastCTQuery = time.Now()
+	ctMutex.Unlock()
 
-	url := fmt.Sprintf("https://crt.sh/?q=%%.%s&output=json", domain)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		fmt.Printf("   ⚠️  Error creating request for %s: %v\n", domain, err)
-		return nil
+	var resp *http.Response
+	var body []byte
+
+	// Retry logic
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), ctQueryTimeout)
+		defer cancel()
+
+		url := fmt.Sprintf("https://crt.sh/?q=%%.%s&output=json", domain)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			fmt.Printf("   ⚠️  Error creating request for %s: %v\n", domain, err)
+			return nil
+		}
+
+		// Add headers to look more like a browser
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+		client := &http.Client{
+			Timeout: ctQueryTimeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     30 * time.Second,
+				DisableKeepAlives:   false,
+			},
+		}
+
+		resp, err = client.Do(req)
+		if err != nil {
+			if attempt == maxRetries {
+				fmt.Printf("   ⚠️  Final attempt failed for %s: %v\n", domain, err)
+				return nil
+			}
+			fmt.Printf("   ⚠️  Attempt %d failed for %s: %v\n", attempt, domain, err)
+			time.Sleep(retryDelay * time.Duration(attempt))
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 429 {
+			if attempt == maxRetries {
+				fmt.Printf("   ⚠️  Rate limit reached for %s after %d attempts\n", domain, attempt)
+				return nil
+			}
+			waitTime := retryDelay * time.Duration(attempt)
+			fmt.Printf("   ⚠️  Rate limited for %s, waiting %v before retry\n", domain, waitTime)
+			time.Sleep(waitTime)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			if attempt == maxRetries {
+				fmt.Printf("   ⚠️  Bad status code from crt.sh for %s: %d\n", domain, resp.StatusCode)
+				return nil
+			}
+			time.Sleep(retryDelay * time.Duration(attempt))
+			continue
+		}
+
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			if attempt == maxRetries {
+				fmt.Printf("   ⚠️  Error reading response for %s: %v\n", domain, err)
+				return nil
+			}
+			continue
+		}
+
+		// If we got here, we have a successful response
+		break
 	}
 
-	// Add User-Agent header to prevent blocking
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-
-	client := &http.Client{
-		Timeout: ctQueryTimeout,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     30 * time.Second,
-			DisableKeepAlives:   false,
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("   ⚠️  Error querying crt.sh for %s: %v\n", domain, err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("   ⚠️  Bad status code from crt.sh for %s: %d\n", domain, resp.StatusCode)
-		return nil
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("   ⚠️  Error reading response for %s: %v\n", domain, err)
-		return nil
-	}
-
+	// Process the response
 	var entries []struct {
 		NameValue string `json:"name_value"`
 	}
 
 	if err := json.Unmarshal(body, &entries); err != nil {
 		fmt.Printf("   ⚠️  Error parsing JSON for %s: %v\n", domain, err)
-		// Try to print the response body for debugging
-		fmt.Printf("   Response body: %s\n", string(body))
 		return nil
 	}
 
@@ -305,8 +356,6 @@ func queryCTSource(domain string, source CTSource) []Result {
 			name = strings.ToLower(strings.TrimSpace(name))
 			if strings.HasSuffix(name, "."+domain) && !seen[name] {
 				seen[name] = true
-
-				// Try DNS resolution
 				if records := checkSubdomainWithResolver(name, createResolver(resolvers[0])); records != nil {
 					results = append(results, Result{
 						Domain:    domain,
@@ -314,7 +363,6 @@ func queryCTSource(domain string, source CTSource) []Result {
 						Records:   records,
 						Source:    "crt.sh",
 					})
-					fmt.Printf("   ✅ Verified subdomain: %s\n", name)
 				}
 			}
 		}
